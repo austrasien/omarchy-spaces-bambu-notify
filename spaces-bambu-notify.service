@@ -1,0 +1,13 @@
+[Unit]
+Description=Report Bambu Lab print status to Omarchy Spaces
+After=dbus.service
+
+[Service]
+Type=simple
+ExecStart=%h/.config/omarchy/bin/spaces-bambu-notify
+Restart=on-failure
+RestartSec=2
+Environment=PATH=%h/.config/omarchy/bin:/usr/share/omarchy/bin:/usr/bin
+
+[Install]
+WantedBy=default.target

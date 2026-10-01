@@ -1,0 +1,989 @@
+#!/usr/bin/env python3
+"""Report Bambu Lab print status to the Omarchy Spaces bar.
+
+Attaches working / waiting / done to the Bambu Studio window, same IPC as
+the Cursor and Grok reporters. No window → no badge.
+
+Print state comes from the printer's MQTT (cloud if ~/.config/omarchy/bambu.env
+has a token, otherwise LAN). Credentials are never logged. Spaces gets
+pids[0]=this reporter (liveness probe) then the Bambu Studio window PID.
+"""
+
+import ipaddress
+import json
+import os
+import select
+import signal
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PLUGIN = "tornikegomareli.spaces"
+STUDIO_CLASS = "BambuStudio"
+CONF_PATH = Path.home() / ".config/BambuStudio/BambuStudio.conf"
+CLOUD_ENV = Path.home() / ".config/omarchy/bambu.env"
+HOST_CACHE = Path.home() / ".local/state/omarchy/bambu-mqtt-host"
+ACK_PATH = Path.home() / ".local/state/omarchy/bambu-done-ack"
+PLUGINS_DIR = Path.home() / ".config/omarchy/plugins"
+SPACES_DIR = PLUGINS_DIR / PLUGIN
+CLOUD_HOST = "us.mqtt.bambulab.com"
+MQTT_PORT = 8883
+KEEPALIVE = 20
+LIVE_PRINT = {"RUNNING", "PREPARE", "SLICING"}
+
+last_state = None
+last_studio_pids = []
+last_gcode = None
+finish_latched = False
+finish_key = ""
+acked_key = ""
+cached_studio_pids = []
+cached_studio_addrs = set()
+mqtt_sock = None
+mqtt_buf = b""
+mqtt_ok_at = 0.0
+next_ping = 0.0
+next_scan = 0.0
+backoff = 1.0
+serial = ""
+access_code = ""
+session = "bambu"
+cloud_user = ""
+cloud_password = ""
+hypr_event_sock = None
+hypr_event_buf = b""
+token_warned = False
+spaces_stamp = None
+shell_pid = 0
+reannounce_at = 0.0
+
+
+def log(msg):
+    print(f"spaces-bambu-notify: {msg}", file=sys.stderr)
+
+
+def load_studio_conf():
+    global serial, access_code, session
+    try:
+        data = json.loads(CONF_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    serial = str(data.get("app", {}).get("user_last_selected_machine") or "")
+    codes = data.get("user_access_code") or {}
+    if not codes.get(serial):
+        codes = data.get("access_code") or {}
+    access_code = str(codes.get(serial) or "")
+    if serial:
+        session = f"bambu-{serial}"
+
+
+def load_cloud_env():
+    global cloud_user, cloud_password
+    cloud_user = os.environ.get("BAMBU_MQTT_USER", "")
+    cloud_password = os.environ.get("BAMBU_MQTT_PASSWORD", "")
+    if not CLOUD_ENV.is_file():
+        return
+    try:
+        for line in CLOUD_ENV.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key, value = key.strip(), value.strip().strip('"').strip("'")
+            if key == "BAMBU_MQTT_USER":
+                cloud_user = value
+            elif key in {"BAMBU_MQTT_PASSWORD", "BAMBU_ACCESS_TOKEN"}:
+                cloud_password = value
+    except OSError:
+        return
+    if cloud_password and not cloud_user:
+        user_id = ""
+        try:
+            data = json.loads(CONF_PATH.read_text(encoding="utf-8"))
+            user_id = str(data.get("app", {}).get("preset_folder") or "")
+        except (OSError, json.JSONDecodeError):
+            pass
+        if user_id:
+            cloud_user = f"u_{user_id}"
+
+
+def hypr_instance_dir():
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or ""
+    if sig:
+        path = runtime / "hypr" / sig
+        if (path / ".socket.sock").exists():
+            return path
+    hypr = runtime / "hypr"
+    try:
+        dirs = [p for p in hypr.iterdir() if (p / ".socket.sock").exists()]
+    except OSError:
+        return None
+    if not dirs:
+        return None
+    return max(dirs, key=lambda p: p.stat().st_mtime)
+
+
+def hypr_json(cmd):
+    """Talk to Hyprland's IPC socket. hyprctl is a fallback (fork, ~30× slower)."""
+    inst = hypr_instance_dir()
+    if inst is not None:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            sock.connect(str(inst / ".socket.sock"))
+            sock.sendall(cmd.encode())
+            chunks = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            sock.close()
+            return json.loads(b"".join(chunks))
+        except (OSError, json.JSONDecodeError):
+            pass
+    name = cmd[2:] if cmd.startswith("j/") else cmd
+    return json.loads(subprocess.check_output(["hyprctl", name, "-j"], text=True))
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            stat = fh.read()
+    except OSError:
+        return False
+    rest = stat[stat.rfind(")") + 1 :].strip()
+    return rest[:1] != "Z"
+
+
+def bambu_windows():
+    global cached_studio_addrs
+    try:
+        clients = hypr_json("j/clients")
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return []
+    if not isinstance(clients, list):
+        return []
+    wins = [c for c in clients if c.get("class") == STUDIO_CLASS]
+    cached_studio_addrs = {str(c.get("address") or "") for c in wins if c.get("address")}
+    return wins
+
+
+def bambu_window_pids():
+    global cached_studio_pids
+    if cached_studio_pids and all(pid_alive(p) for p in cached_studio_pids):
+        return list(cached_studio_pids)
+    pids = []
+    for client in bambu_windows():
+        pid = int(client.get("pid") or 0)
+        if pid > 1 and pid not in pids:
+            pids.append(pid)
+    cached_studio_pids = pids
+    return list(pids)
+
+
+def badge_pids(studio_pids):
+    """pids[0] is this reporter (Spaces live probe); later PIDs are Studio windows."""
+    reporter = os.getpid()
+    out = [reporter]
+    for pid in studio_pids or []:
+        if pid > 1 and pid != reporter and pid not in out:
+            out.append(pid)
+    return out
+
+
+def warn_cloud_token():
+    global token_warned
+    if token_warned:
+        return
+    token_warned = True
+    log("cloud token refused (CONNACK 5); update BAMBU_MQTT_PASSWORD in ~/.config/omarchy/bambu.env")
+    subprocess.Popen(
+        [
+            "notify-send",
+            "-u",
+            "critical",
+            "Bambu Spaces",
+            "Jeton MQTT Bambu refusé. Mets à jour BAMBU_MQTT_PASSWORD dans ~/.config/omarchy/bambu.env puis : systemctl --user restart spaces-bambu-notify",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def shell_pid_now():
+    global shell_pid
+    if shell_pid and pid_alive(shell_pid):
+        return shell_pid
+    found = 0
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                raw = Path(f"/proc/{name}/cmdline").read_bytes()
+            except OSError:
+                continue
+            if b"quickshell" in raw or b"omarchy-shell" in raw:
+                found = int(name)
+                break
+    except OSError:
+        pass
+    shell_pid = found
+    return found
+
+
+def plugins_stamp():
+    stamp = 0.0
+    paths = [PLUGINS_DIR, SPACES_DIR, SPACES_DIR / "Spaces.qml", SPACES_DIR / "Model.js"]
+    try:
+        paths.extend(p for p in PLUGINS_DIR.iterdir())
+    except OSError:
+        pass
+    for path in paths:
+        try:
+            stamp = max(stamp, path.stat().st_mtime)
+        except OSError:
+            continue
+    return (stamp, shell_pid_now())
+
+
+def spaces_needs_reannounce():
+    """True once, ~0.4s after Spaces/plugins/shell actually reloaded."""
+    global spaces_stamp, reannounce_at
+    now = time.monotonic()
+    current = plugins_stamp()
+    if spaces_stamp is None:
+        spaces_stamp = current
+        return False
+    if current != spaces_stamp:
+        spaces_stamp = current
+        reannounce_at = now + 0.4
+        log("spaces reload detected")
+        return False
+    if reannounce_at and now >= reannounce_at:
+        reannounce_at = 0.0
+        return True
+    return False
+
+
+def studio_on_active_workspace():
+    try:
+        active = hypr_json("j/activeworkspace")
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return False
+    if not isinstance(active, dict):
+        return False
+    aid = active.get("id")
+    for client in bambu_windows():
+        ws = client.get("workspace") or {}
+        if ws.get("id") == aid:
+            return True
+    return False
+
+
+def load_ack():
+    global acked_key
+    try:
+        data = json.loads(ACK_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        acked_key = ""
+        return
+    acked_key = str(data.get("key") or "")
+
+
+def save_ack(key):
+    global acked_key
+    acked_key = key
+    try:
+        ACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ACK_PATH.write_text(
+            json.dumps({"key": key, "acked_at": int(time.time())}) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def job_key(block, previous=""):
+    if not isinstance(block, dict):
+        return previous
+    for field in ("subtask_id", "task_id", "job_id"):
+        value = block.get(field)
+        if value not in (None, "", 0, "0"):
+            return f"{field}:{value}"
+    name = block.get("gcode_file") or block.get("subtask_name") or ""
+    start = block.get("print_start_time") or ""
+    if name or start:
+        return f"file:{name}:{start}"
+    return previous
+
+
+def clear_stale_ack():
+    """A live print must not keep the ack written during the FINISH→PREPARE race."""
+    global acked_key
+    if not finish_key or acked_key != finish_key:
+        return
+    log(f"stale ack dropped key={finish_key}")
+    acked_key = ""
+    try:
+        ACK_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def maybe_ack_done():
+    if not finish_key or acked_key == finish_key:
+        return
+    state = ((last_gcode or {}).get("gcode_state") or "").upper()
+    if state in LIVE_PRINT or state in {"PAUSE", "FAILED"}:
+        return
+    if state != "FINISH" and not finish_latched:
+        return
+    if not studio_on_active_workspace():
+        return
+    save_ack(finish_key)
+    log(f"done acked key={finish_key}")
+    pids = bambu_window_pids()
+    if last_state == "done":
+        report("end", pids or last_studio_pids)
+
+
+def studio_process_pids():
+    pids = []
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            if comm in {"bambu-studio", "bambustu_main"}:
+                pids.append(int(pid))
+    except OSError:
+        pass
+    return pids
+
+
+def ipv4_from_hex(hex_ip):
+    return socket.inet_ntoa(bytes.fromhex(hex_ip)[::-1])
+
+
+def tcp_table_hosts():
+    """Private peers on :8883 (Studio SYN/ESTAB). /proc/PID/net/tcp is the netns table, not per-socket."""
+    hosts = []
+    try:
+        lines = Path("/proc/net/tcp").read_text().splitlines()[1:]
+    except OSError:
+        return hosts
+    for line in lines:
+        parts = line.split()
+        ip_hex, port_hex = parts[2].split(":")
+        if int(port_hex, 16) != MQTT_PORT:
+            continue
+        ip = ipv4_from_hex(ip_hex)
+        if ip in hosts or ip == "0.0.0.0" or not is_private(ip):
+            continue
+        hosts.append(ip)
+    return hosts
+
+
+def studio_hint_hosts():
+    return tcp_table_hosts()
+
+
+def cached_host():
+    try:
+        host = HOST_CACHE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return host
+
+
+def save_host(host):
+    try:
+        HOST_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        HOST_CACHE.write_text(host + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def local_subnets():
+    nets = []
+    try:
+        addrs = subprocess.check_output(["ip", "-4", "-json", "addr"], text=True)
+        for item in json.loads(addrs):
+            if item.get("ifname") in {"lo"}:
+                continue
+            for info in item.get("addr_info") or []:
+                if info.get("family") != "inet":
+                    continue
+                ip = info.get("local")
+                prefix = int(info.get("prefixlen") or 24)
+                if not ip:
+                    continue
+                net = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+                if net.is_private and net.num_addresses <= 256:
+                    nets.append(net)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
+        pass
+    return nets
+
+
+def scan_lan_mqtt(timeout=0.12):
+    found = []
+    ips = []
+    for net in local_subnets():
+        for host in net.hosts():
+            ips.append(str(host))
+    if not ips:
+        return found
+
+    def probe(ip):
+        sock = socket.socket()
+        sock.settimeout(timeout)
+        try:
+            sock.connect((ip, MQTT_PORT))
+            return ip
+        except OSError:
+            return None
+        finally:
+            sock.close()
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(32) as pool:
+        for ip in pool.map(probe, ips):
+            if ip:
+                found.append(ip)
+    return found
+
+
+def is_private(ip):
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
+
+
+def mqtt_remaining(n):
+    out = b""
+    while True:
+        digit = n % 128
+        n //= 128
+        if n:
+            digit |= 0x80
+        out += bytes([digit])
+        if not n:
+            return out
+
+
+def mqtt_str(text):
+    raw = text.encode("utf-8")
+    return struct.pack("!H", len(raw)) + raw
+
+
+def mqtt_connect_packet(client_id, username, password):
+    payload = mqtt_str(client_id) + mqtt_str(username) + mqtt_str(password)
+    variable = mqtt_str("MQTT") + bytes([4, 0xC2]) + struct.pack("!H", KEEPALIVE)
+    return bytes([0x10]) + mqtt_remaining(len(variable) + len(payload)) + variable + payload
+
+
+def mqtt_subscribe_packet(topic, packet_id=1):
+    payload = struct.pack("!H", packet_id) + mqtt_str(topic) + b"\x00"
+    return bytes([0x82]) + mqtt_remaining(len(payload)) + payload
+
+
+def mqtt_publish_packet(topic, payload):
+    body = mqtt_str(topic) + payload.encode("utf-8")
+    return bytes([0x30]) + mqtt_remaining(len(body)) + body
+
+
+def parse_remaining(buf, start):
+    n = 0
+    shift = 0
+    i = start
+    while True:
+        if i >= len(buf):
+            return None, start
+        byte = buf[i]
+        n |= (byte & 0x7F) << shift
+        i += 1
+        if byte & 0x80 == 0:
+            return n, i
+        shift += 7
+        if shift > 21:
+            return None, start
+
+
+def try_connect(host, username, password, insecure):
+    ctx = ssl.create_default_context()
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    raw = socket.create_connection((host, MQTT_PORT), timeout=2)
+    try:
+        sock = ctx.wrap_socket(raw, server_hostname=None if insecure else host)
+        sock.settimeout(2)
+        client_id = f"omarchy-spaces-{os.getpid()}"
+        sock.sendall(mqtt_connect_packet(client_id, username, password))
+        data = sock.recv(8)
+        if len(data) >= 4 and data[0] == 0x20 and data[3] == 0:
+            sock.setblocking(False)
+            return sock
+        rc = data[3] if len(data) >= 4 else "short"
+        log(f"connack refused host={host} rc={rc}")
+        if not insecure and rc == 5:
+            warn_cloud_token()
+        sock.close()
+        return None
+    except Exception:
+        try:
+            raw.close()
+        except OSError:
+            pass
+        raise
+
+
+def close_mqtt():
+    global mqtt_sock, mqtt_buf, mqtt_ok_at
+    sock = mqtt_sock
+    mqtt_sock = None
+    mqtt_buf = b""
+    mqtt_ok_at = 0.0
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def ensure_mqtt():
+    global mqtt_sock, mqtt_ok_at, next_ping, backoff, next_scan, token_warned
+    if mqtt_sock is not None:
+        return True
+    now = time.monotonic()
+    if now < mqtt_ok_at:
+        return False
+
+    load_studio_conf()
+    load_cloud_env()
+    if not serial:
+        log("no printer serial in BambuStudio.conf")
+        mqtt_ok_at = now + 15
+        return False
+
+    candidates = []
+    # Cloud when we have a token. LAN MQTT is single-client and fights Studio.
+    if cloud_user and cloud_password:
+        candidates.append(CLOUD_HOST)
+    else:
+        for host in [cached_host(), *studio_hint_hosts()]:
+            if host and host not in candidates:
+                candidates.append(host)
+        if now >= next_scan and not candidates:
+            next_scan = now + 60
+            try:
+                for host in scan_lan_mqtt():
+                    if host not in candidates:
+                        candidates.append(host)
+            except Exception:
+                traceback_print()
+        elif candidates:
+            next_scan = now + 60
+
+    last_error = "no hosts"
+    for host in candidates:
+        private = is_private(host)
+        if private:
+            if not access_code:
+                continue
+            user, password, insecure = "bblp", access_code, True
+            save_host(host)
+        else:
+            if not (cloud_user and cloud_password):
+                continue
+            user, password, insecure = cloud_user, cloud_password, False
+        try:
+            sock = try_connect(host, user, password, insecure)
+        except Exception as exc:
+            last_error = f"{host} {type(exc).__name__}"
+            continue
+        if sock is None:
+            last_error = f"{host} refused"
+            continue
+        mqtt_sock = sock
+        backoff = 1.0
+        save_host(host)
+        topic_report = f"device/{serial}/report"
+        topic_request = f"device/{serial}/request"
+        try:
+            sock.sendall(mqtt_subscribe_packet(topic_report))
+            sock.sendall(
+                mqtt_publish_packet(
+                    topic_request,
+                    json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}}),
+                )
+            )
+        except OSError as exc:
+            last_error = f"{host} subscribe {type(exc).__name__}"
+            close_mqtt()
+            continue
+        next_ping = now + KEEPALIVE
+        if not private:
+            token_warned = False
+        log(f"mqtt connected host={host} lan={private}")
+        return True
+
+    if cloud_user and cloud_password and CLOUD_HOST not in candidates:
+        try:
+            sock = try_connect(CLOUD_HOST, cloud_user, cloud_password, False)
+            if sock is not None:
+                mqtt_sock = sock
+                backoff = 1.0
+                sock.sendall(mqtt_subscribe_packet(f"device/{serial}/report"))
+                sock.sendall(
+                    mqtt_publish_packet(
+                        f"device/{serial}/request",
+                        json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}}),
+                    )
+                )
+                next_ping = now + KEEPALIVE
+                log("mqtt connected host=cloud")
+                return True
+        except Exception as exc:
+            last_error = f"cloud {type(exc).__name__}"
+
+    mqtt_ok_at = now + backoff
+    backoff = min(30.0, backoff * 2)
+    log(f"mqtt retry in {backoff:.0f}s ({last_error})")
+    return False
+
+
+def traceback_print():
+    import traceback
+
+    traceback.print_exc()
+
+
+def map_state(gcode_state, print_error):
+    global finish_latched
+    state = (gcode_state or "").upper()
+    if print_error:
+        finish_latched = False
+        return "waiting"
+    if state in {"PAUSE", "FAILED"}:
+        finish_latched = False
+        return "waiting"
+    if state in LIVE_PRINT:
+        finish_latched = False
+        clear_stale_ack()
+        return "working"
+    if state == "FINISH":
+        finish_latched = True
+        if finish_key and acked_key == finish_key:
+            return "end"
+        return "done"
+    if state == "IDLE":
+        if finish_latched and not (finish_key and acked_key == finish_key):
+            return "done"
+        return "end"
+    return None
+
+
+def report(state, studio_pids, force=False):
+    global last_state, last_studio_pids
+    studio_pids = [int(p) for p in (studio_pids or []) if int(p) > 1]
+    if not state:
+        return
+    if state != "end" and not studio_pids:
+        return
+    if state == "end" and last_state is None:
+        return
+    same = state == last_state and studio_pids == last_studio_pids
+    if same and not force:
+        return
+    last_state = None if state == "end" else state
+    if studio_pids:
+        last_studio_pids = list(studio_pids)
+    pids = badge_pids(studio_pids or last_studio_pids)
+    subprocess.Popen(
+        [
+            "omarchy-shell",
+            PLUGIN,
+            "agent",
+            session,
+            state,
+            ",".join(str(pid) for pid in pids),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    extra = pids[1] if len(pids) > 1 else "-"
+    log(f"{state} reporter={pids[0] if pids else '-'} studio={extra}")
+
+
+def publish_mapped(force=False):
+    maybe_ack_done()
+    pids = bambu_window_pids()
+    if not pids:
+        if last_state:
+            report("end", last_studio_pids)
+        return
+    if last_gcode is None:
+        return
+    state = map_state(last_gcode.get("gcode_state"), last_gcode.get("print_error"))
+    if not state:
+        return
+    if state == "done" and finish_key and acked_key == finish_key:
+        if last_state == "done":
+            report("end", pids, force=force)
+        return
+    report(state, pids, force=force)
+
+
+def handle_payload(payload):
+    global last_gcode, finish_key
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return
+    block = data.get("print")
+    if not isinstance(block, dict):
+        return
+    if "gcode_state" not in block and "print_error" not in block:
+        return
+    new_key = job_key(block, finish_key)
+    new_gcode = {
+        "gcode_state": block.get("gcode_state") or (last_gcode or {}).get("gcode_state"),
+        "print_error": block.get("print_error") or 0,
+    }
+    changed = new_gcode != last_gcode or new_key != finish_key
+    finish_key = new_key
+    last_gcode = new_gcode
+    if not changed:
+        return
+    log(f"printer {last_gcode['gcode_state']} err={last_gcode['print_error']}")
+    publish_mapped()
+
+
+def mqtt_tick():
+    global mqtt_buf, next_ping
+    if mqtt_sock is None and not ensure_mqtt():
+        return
+    sock = mqtt_sock
+    if sock is None:
+        return
+    now = time.monotonic()
+    if now >= next_ping:
+        try:
+            sock.sendall(b"\xc0\x00")
+            next_ping = now + KEEPALIVE
+        except OSError:
+            close_mqtt()
+            return
+    try:
+        ready, _, _ = select.select([sock], [], [], 0)
+    except (OSError, ValueError):
+        close_mqtt()
+        return
+    if not ready:
+        return
+    try:
+        chunk = sock.recv(65536)
+    except BlockingIOError:
+        return
+    except OSError:
+        close_mqtt()
+        return
+    if not chunk:
+        close_mqtt()
+        return
+    mqtt_buf += chunk
+    while True:
+        if len(mqtt_buf) < 2:
+            return
+        remaining, idx = parse_remaining(mqtt_buf, 1)
+        if remaining is None:
+            return
+        total = idx + remaining
+        if len(mqtt_buf) < total:
+            return
+        packet = mqtt_buf[:total]
+        mqtt_buf = mqtt_buf[total:]
+        kind = packet[0] & 0xF0
+        if kind == 0x30:
+            topic_len = struct.unpack("!H", packet[idx : idx + 2])[0]
+            start = idx + 2 + topic_len
+            qos = (packet[0] >> 1) & 0x03
+            if qos:
+                start += 2
+            handle_payload(packet[start:])
+        elif kind == 0xD0:
+            pass
+        elif kind == 0x90:
+            pass
+
+
+def window_tick():
+    force = spaces_needs_reannounce()
+    pids = bambu_window_pids()
+    if not pids:
+        if last_state:
+            report("end", last_studio_pids, force=force)
+        return
+    if last_gcode:
+        publish_mapped(force=force)
+
+
+def invalidate_studio_cache():
+    global cached_studio_pids
+    cached_studio_pids = []
+
+
+def close_hypr_events():
+    global hypr_event_sock, hypr_event_buf
+    sock = hypr_event_sock
+    hypr_event_sock = None
+    hypr_event_buf = b""
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def connect_hypr_events():
+    global hypr_event_sock, hypr_event_buf
+    if hypr_event_sock is not None:
+        return True
+    inst = hypr_instance_dir()
+    if inst is None:
+        return False
+    path = inst / ".socket2.sock"
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        sock.connect(str(path))
+        sock.setblocking(False)
+    except OSError:
+        return False
+    hypr_event_sock = sock
+    hypr_event_buf = b""
+    return True
+
+
+def handle_hypr_event(line):
+    text = line.strip()
+    if not text:
+        return
+    if text.startswith("openwindow>>"):
+        payload = text.split(">>", 1)[1]
+        parts = payload.split(",", 3)
+        if len(parts) >= 3 and parts[2] == STUDIO_CLASS:
+            invalidate_studio_cache()
+            window_tick()
+        return
+    if text.startswith("closewindow>>"):
+        addr = text.split(">>", 1)[1].strip()
+        if addr in cached_studio_addrs or cached_studio_pids:
+            invalidate_studio_cache()
+            cached_studio_addrs.discard(addr)
+            window_tick()
+        return
+    if text.startswith(("workspace>>", "workspacev2>>", "activespecial>>")):
+        if finish_latched or ((last_gcode or {}).get("gcode_state") or "").upper() == "FINISH":
+            window_tick()
+
+
+def hypr_event_tick():
+    global hypr_event_buf
+    if hypr_event_sock is None and not connect_hypr_events():
+        return
+    sock = hypr_event_sock
+    if sock is None:
+        return
+    try:
+        ready, _, _ = select.select([sock], [], [], 0)
+    except (OSError, ValueError):
+        close_hypr_events()
+        return
+    if not ready:
+        return
+    try:
+        chunk = sock.recv(65536)
+    except BlockingIOError:
+        return
+    except OSError:
+        close_hypr_events()
+        return
+    if not chunk:
+        close_hypr_events()
+        return
+    hypr_event_buf += chunk
+    while b"\n" in hypr_event_buf:
+        line, hypr_event_buf = hypr_event_buf.split(b"\n", 1)
+        try:
+            handle_hypr_event(line.decode("utf-8", errors="replace"))
+        except Exception:
+            traceback_print()
+
+
+def wait_timeout(next_window):
+    now = time.monotonic()
+    timeout = max(0.0, next_window - now)
+    if mqtt_sock is not None:
+        timeout = min(timeout, max(0.0, next_ping - now))
+    elif mqtt_ok_at > now:
+        timeout = min(timeout, mqtt_ok_at - now)
+    if reannounce_at:
+        timeout = min(timeout, max(0.0, reannounce_at - now))
+    return timeout
+
+
+def main():
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    load_studio_conf()
+    load_cloud_env()
+    load_ack()
+    connect_hypr_events()
+    log(f"watching session={session} cloud={'yes' if cloud_password else 'no'}")
+    next_window = 0.0
+    while True:
+        try:
+            socks = [s for s in (mqtt_sock, hypr_event_sock) if s is not None]
+            try:
+                select.select(socks, [], [], wait_timeout(next_window))
+            except (OSError, ValueError):
+                close_mqtt()
+                close_hypr_events()
+            mqtt_tick()
+            hypr_event_tick()
+            now = time.monotonic()
+            if now >= next_window or (reannounce_at and now >= reannounce_at):
+                if now >= next_window:
+                    next_window = now + 2
+                window_tick()
+        except Exception:
+            traceback_print()
+            close_mqtt()
+            close_hypr_events()
+            time.sleep(1)
+            continue
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
