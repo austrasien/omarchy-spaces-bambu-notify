@@ -33,6 +33,7 @@ SPACES_DIR = PLUGINS_DIR / PLUGIN
 CLOUD_HOST = "us.mqtt.bambulab.com"
 MQTT_PORT = 8883
 KEEPALIVE = 20
+END_GRACE = 0.8
 LIVE_PRINT = {"RUNNING", "PREPARE", "SLICING"}
 
 last_state = None
@@ -60,6 +61,7 @@ token_warned = False
 spaces_stamp = None
 shell_pid = 0
 reannounce_at = 0.0
+studio_missing_since = 0.0
 
 
 def log(msg):
@@ -540,7 +542,6 @@ def try_connect(host, username, password, insecure):
         sock.sendall(mqtt_connect_packet(client_id, username, password))
         data = sock.recv(8)
         if len(data) >= 4 and data[0] == 0x20 and data[3] == 0:
-            sock.setblocking(False)
             return sock
         rc = data[3] if len(data) >= 4 else "short"
         log(f"connack refused host={host} rc={rc}")
@@ -640,6 +641,7 @@ def ensure_mqtt():
             last_error = f"{host} subscribe {type(exc).__name__}"
             close_mqtt()
             continue
+        sock.setblocking(False)
         next_ping = now + KEEPALIVE
         if not private:
             token_warned = False
@@ -659,6 +661,7 @@ def ensure_mqtt():
                         json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}}),
                     )
                 )
+                sock.setblocking(False)
                 next_ping = now + KEEPALIVE
                 log("mqtt connected host=cloud")
                 return True
@@ -718,7 +721,7 @@ def report(state, studio_pids, force=False):
     if studio_pids:
         last_studio_pids = list(studio_pids)
     pids = badge_pids(studio_pids or last_studio_pids)
-    subprocess.Popen(
+    subprocess.run(
         [
             "omarchy-shell",
             PLUGIN,
@@ -729,7 +732,8 @@ def report(state, studio_pids, force=False):
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True,
+        timeout=2,
+        check=False,
     )
     extra = pids[1] if len(pids) > 1 else "-"
     log(f"{state} reporter={pids[0] if pids else '-'} studio={extra}")
@@ -791,6 +795,8 @@ def mqtt_tick():
         try:
             sock.sendall(b"\xc0\x00")
             next_ping = now + KEEPALIVE
+        except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+            return
         except OSError:
             close_mqtt()
             return
@@ -803,7 +809,7 @@ def mqtt_tick():
         return
     try:
         chunk = sock.recv(65536)
-    except BlockingIOError:
+    except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
         return
     except OSError:
         close_mqtt()
@@ -837,13 +843,41 @@ def mqtt_tick():
             pass
 
 
+def request_pushall():
+    sock = mqtt_sock
+    if sock is None or not serial:
+        return
+    try:
+        sock.sendall(
+            mqtt_publish_packet(
+                f"device/{serial}/request",
+                json.dumps({"pushing": {"sequence_id": "1", "command": "pushall"}}),
+            )
+        )
+    except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+        return
+    except OSError:
+        close_mqtt()
+
+
 def window_tick():
+    global studio_missing_since
     force = spaces_needs_reannounce()
     pids = bambu_window_pids()
+    now = time.monotonic()
     if not pids:
         if last_state:
-            report("end", last_studio_pids, force=force)
+            if not studio_missing_since:
+                studio_missing_since = now
+            elif now - studio_missing_since >= END_GRACE:
+                report("end", last_studio_pids, force=force)
+                studio_missing_since = 0.0
         return
+    appeared = bool(studio_missing_since) or last_state is None
+    studio_missing_since = 0.0
+    if appeared:
+        request_pushall()
+        force = True
     if last_gcode:
         publish_mapped(force=force)
 
@@ -898,7 +932,7 @@ def handle_hypr_event(line):
         return
     if text.startswith("closewindow>>"):
         addr = text.split(">>", 1)[1].strip()
-        if addr in cached_studio_addrs or cached_studio_pids:
+        if addr in cached_studio_addrs:
             invalidate_studio_cache()
             cached_studio_addrs.discard(addr)
             window_tick()
@@ -950,6 +984,8 @@ def wait_timeout(next_window):
         timeout = min(timeout, mqtt_ok_at - now)
     if reannounce_at:
         timeout = min(timeout, max(0.0, reannounce_at - now))
+    if studio_missing_since:
+        timeout = min(timeout, max(0.0, studio_missing_since + END_GRACE - now))
     return timeout
 
 

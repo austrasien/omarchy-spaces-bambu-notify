@@ -8,7 +8,7 @@ Spaces is unchanged. This process watches the printer over MQTT and calls:
 omarchy-shell tornikegomareli.spaces agent <session> <working|waiting|done|end> <pids>
 ```
 
-`pids[0]` is this reporter (Spaces’ 60s liveness probe). A later PID is the `BambuStudio` window, so the badge sits on that icon. No Studio window → no badge; MQTT still runs in the background.
+`pids[0]` is this reporter (Spaces’ 60s liveness probe). A later PID is the `BambuStudio` window, so the badge sits on that icon. No Studio window → no badge; MQTT still runs in the background. Opening Studio sends `pushall` immediately. An `end` is delayed ~0.8 s so a splash→window remap does not clear the chip.
 
 ## Install (Omarchy)
 
