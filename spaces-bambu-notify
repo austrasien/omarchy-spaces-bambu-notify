@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 
 PLUGIN = "tornikegomareli.spaces"
+# Every plugin showing agent state gets each report: Spaces and the minimap.
+AGENT_PLUGINS = (PLUGIN, "austraz.minimap")
 STUDIO_CLASS = "BambuStudio"
 CONF_PATH = Path.home() / ".config/BambuStudio/BambuStudio.conf"
 CLOUD_ENV = Path.home() / ".config/omarchy/bambu.env"
@@ -721,20 +723,21 @@ def report(state, studio_pids, force=False):
     if studio_pids:
         last_studio_pids = list(studio_pids)
     pids = badge_pids(studio_pids or last_studio_pids)
-    subprocess.run(
-        [
-            "omarchy-shell",
-            PLUGIN,
-            "agent",
-            session,
-            state,
-            ",".join(str(pid) for pid in pids),
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=2,
-        check=False,
-    )
+    for plugin in AGENT_PLUGINS:
+        subprocess.run(
+            [
+                "omarchy-shell",
+                plugin,
+                "agent",
+                session,
+                state,
+                ",".join(str(pid) for pid in pids),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
     extra = pids[1] if len(pids) > 1 else "-"
     log(f"{state} reporter={pids[0] if pids else '-'} studio={extra}")
 
