@@ -23,8 +23,9 @@ import time
 from pathlib import Path
 
 PLUGIN = "tornikegomareli.spaces"
-# Every plugin showing agent state gets each report: Spaces and the minimap.
-AGENT_PLUGINS = (PLUGIN, "austraz.minimap")
+# Agent state goes to the minimap (Spaces is disabled; add PLUGIN back to
+# report to it again).
+AGENT_PLUGINS = ("austraz.minimap",)
 STUDIO_CLASS = "BambuStudio"
 CONF_PATH = Path.home() / ".config/BambuStudio/BambuStudio.conf"
 CLOUD_ENV = Path.home() / ".config/omarchy/bambu.env"
