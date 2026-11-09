@@ -23,9 +23,9 @@ import time
 from pathlib import Path
 
 PLUGIN = "tornikegomareli.spaces"
-# Agent state goes to the minimap (Spaces is disabled; add PLUGIN back to
+# Agent state goes to the day bar (Spaces is disabled; add PLUGIN back to
 # report to it again).
-AGENT_PLUGINS = ("austraz.minimap",)
+AGENT_PLUGINS = ("austraz.daybar",)
 STUDIO_CLASS = "BambuStudio"
 CONF_PATH = Path.home() / ".config/BambuStudio/BambuStudio.conf"
 CLOUD_ENV = Path.home() / ".config/omarchy/bambu.env"
